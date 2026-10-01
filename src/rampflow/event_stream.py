@@ -26,15 +26,34 @@ class StreamEvent:
 class CursorPage:
     events: tuple[StreamEvent, ...]
     next_cursor: int
-    gap: bool
-    reset_cursor: int | None = None
 
 
 class CursorExpired(RuntimeError):
-    pass
+    """Raised when a cursor falls behind the retained floor.
+
+    The stream never silently skips evicted events: an expired cursor is
+    rejected, and the consumer must rebuild its projection from a snapshot
+    and resume at ``reset_cursor``.
+    """
+
+    def __init__(self, cursor: int, floor: int):
+        self.cursor = cursor
+        self.floor = floor
+        self.reset_cursor = floor - 1
+        super().__init__(
+            f"cursor {cursor} is before retained floor {floor}; "
+            f"rebuild from a snapshot and resume at {self.reset_cursor}"
+        )
 
 
 class EventStream:
+    """Hash-chained event log with a fixed retention window.
+
+    Paging with a cursor older than the retained floor raises
+    ``CursorExpired`` instead of clamping to the floor, so a stale consumer
+    can never apply a partial history on top of an outdated base.
+    """
+
     def __init__(self, retention: int = 10000):
         if retention < 1:
             raise ValueError("retention must be positive")
@@ -125,19 +144,17 @@ class EventStream:
         with self._lock:
             return self._events[0].sequence if self._events else self._next_sequence
 
-    def page(self, cursor: int, limit: int = 100, topics: Iterable[str] | None = None, strict: bool = False) -> CursorPage:
+    def page(self, cursor: int, limit: int = 100, topics: Iterable[str] | None = None) -> CursorPage:
         if limit < 1:
             raise ValueError("limit must be positive")
         topic_set = set(topics) if topics is not None else None
         with self._lock:
             floor = self.floor
-            gap = bool(self._events and cursor < floor - 2)
-            if gap and strict:
-                raise CursorExpired(f"cursor {cursor} before retained floor {floor}")
-            effective = max(cursor, floor - 1) if gap else cursor
-            selected = [e for e in self._events if e.sequence > effective and (topic_set is None or e.topic in topic_set)][:limit]
-            next_cursor = selected[-1].sequence if selected else effective
-            return CursorPage(tuple(selected), next_cursor, gap, floor - 1 if gap else None)
+            if self._events and cursor < floor - 1:
+                raise CursorExpired(cursor, floor)
+            selected = [e for e in self._events if e.sequence > cursor and (topic_set is None or e.topic in topic_set)][:limit]
+            next_cursor = selected[-1].sequence if selected else cursor
+            return CursorPage(tuple(selected), next_cursor)
 
     def wait_page(
         self,
@@ -148,7 +165,7 @@ class EventStream:
     ) -> CursorPage:
         with self._changed:
             page = self.page(cursor, limit, topics)
-            if page.events or page.gap:
+            if page.events:
                 return page
             self._changed.wait(timeout_seconds)
             return self.page(cursor, limit, topics)

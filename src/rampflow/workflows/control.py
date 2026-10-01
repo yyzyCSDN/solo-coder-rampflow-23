@@ -91,11 +91,9 @@ class RampWorkflowControl:
         return self._guard(operation_id, "connection.transport.updated", subject, at, action, requirements=requirements)
 
     def acknowledge_stream_projection(self, operation_id: str, subject: str, at: datetime, action: Callable[[], T], requirements: tuple[Decision, ...] = ()) -> OperationReceipt:
-        event = self.stream.publish(operation_id, utc(at), "stream.projection.acknowledged", subject, {"operation_id": operation_id})
-        result = action()
-        receipt = OperationReceipt(operation_id, event.topic, subject, event, result)
-        self._receipts[operation_id] = receipt
-        return receipt
+        # Same guard as every other workflow: the projection action commits
+        # first, and the acknowledgement is published only after it succeeds.
+        return self._guard(operation_id, "stream.projection.acknowledged", subject, at, action, requirements=requirements)
 
     def apply_restriction_policy(self, operation_id: str, subject: str, at: datetime, action: Callable[[], T], requirements: tuple[Decision, ...] = ()) -> OperationReceipt:
         return self._guard(operation_id, "restriction.policy.applied", subject, at, action, requirements=requirements)

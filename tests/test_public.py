@@ -3,7 +3,7 @@ from datetime import datetime, timezone, timedelta, time
 from decimal import Decimal
 
 from rampflow.timeutil import Window
-from rampflow.event_stream import EventStream
+from rampflow.event_stream import EventStream, CursorExpired
 from rampflow.ops_store import VersionedStore, VersionConflict
 from rampflow.operational_snapshot import SnapshotCodec
 from rampflow.fuel_accounting import FuelTank, FuelLedger
@@ -23,6 +23,33 @@ class PublicTests(unittest.TestCase):
         b=s.publish('e1',D(10),'ops','F1',{'x':1})
         self.assertEqual(a,b)
         self.assertTrue(s.verify_chain())
+
+    def test_event_stream_expired_cursor_is_rejected(self):
+        s=EventStream(retention=3)
+        for i in range(5):s.publish(f'e{i}',D(10),'ops','F1',{'i':i})
+        self.assertEqual(s.floor,3)
+        page=s.page(2)
+        self.assertEqual([e.sequence for e in page.events],[3,4,5])
+        self.assertEqual(page.next_cursor,5)
+        with self.assertRaises(CursorExpired) as ctx:
+            s.page(1)
+        self.assertEqual(ctx.exception.reset_cursor,2)
+        self.assertEqual(ctx.exception.floor,3)
+        with self.assertRaises(CursorExpired):
+            s.wait_page(0,0.01)
+
+    def test_versioned_store_batch_is_atomic(self):
+        store=VersionedStore()
+        store.create('a',1,'actor','seed',D(10))
+        store.create('b',1,'actor','seed',D(10))
+        gen=store.generation
+        with self.assertRaises(VersionConflict):
+            store.batch([('put','a',2,1),('put','b',2,99)],'actor','mixed',D(11))
+        self.assertEqual(store.get('a').value,1)
+        self.assertEqual(store.get('b').value,1)
+        self.assertEqual(store.generation,gen)
+        ok=store.batch([('put','a',2,1),('put','b',2,1)],'actor','clean',D(12))
+        self.assertEqual([r.version for r in ok],[2,2])
 
     def test_versioned_store_compare_and_swap(self):
         store=VersionedStore()

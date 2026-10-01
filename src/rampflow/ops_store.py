@@ -98,33 +98,42 @@ class VersionedStore(Generic[T]):
 
     def batch(self, ops: Iterable[tuple[str, str, T | None, int | None]], actor: str, reason: str, at: datetime) -> tuple[Versioned[T] | None, ...]:
         at = utc(at)
-        out = []
+        ops = tuple(ops)
         with self._lock:
-            for action, key, value, expected in tuple(ops):
-                old = self._records.get(key)
+            # Phase 1: validate the whole batch against a shadow of the current
+            # state.  Any conflict aborts here, before anything is committed.
+            shadow = dict(self._records)
+            planned = []
+            out = []
+            for action, key, value, expected in ops:
+                old = shadow.get(key)
                 if action == "create":
                     if old is not None:
                         raise VersionConflict(f"{key} already exists")
                     rec = Versioned(key, 1, at, value)
-                    self._commit_change(key, old, rec, actor, reason, at)
-                    out.append(rec)
                 elif action == "put":
                     if old is None:
                         raise MissingEntity(key)
                     if expected != old.version:
                         raise VersionConflict(f"{key} stale")
                     rec = Versioned(key, old.version + 1, at, value)
-                    self._commit_change(key, old, rec, actor, reason, at)
-                    out.append(rec)
                 elif action == "delete":
                     if old is None:
                         raise MissingEntity(key)
                     if expected != old.version:
                         raise VersionConflict(f"{key} stale")
-                    self._commit_change(key, old, None, actor, reason, at)
-                    out.append(None)
+                    rec = None
                 else:
                     raise ValueError(f"unknown operation {action}")
+                planned.append((key, old, rec))
+                if rec is None:
+                    shadow.pop(key, None)
+                else:
+                    shadow[key] = rec
+                out.append(rec)
+            # Phase 2: every operation validated; commit cannot fail from here.
+            for key, old, rec in planned:
+                self._commit_change(key, old, rec, actor, reason, at)
             return tuple(out)
 
     def changes(self,after_sequence:int=0)->tuple[Change[T],...]:

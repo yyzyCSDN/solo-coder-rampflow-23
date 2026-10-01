@@ -57,6 +57,46 @@ class WorkflowControlTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(control.stream.head, 0)
 
+    def test_projection_ack_commits_before_it_publishes(self):
+        control = RampWorkflowControl()
+        calls = []
+        receipt = control.acknowledge_stream_projection(
+            "op-ack-1", "proj-1", self.at, lambda: calls.append("apply") or 42,
+        )
+        self.assertEqual(receipt.result, 42)
+        self.assertEqual(control.stream.head, 1)
+        event = control.stream.snapshot()[0]
+        self.assertEqual(event.topic, "stream.projection.acknowledged")
+        again = control.acknowledge_stream_projection(
+            "op-ack-1", "proj-1", self.at, lambda: calls.append("duplicate"),
+        )
+        self.assertIs(again, receipt)
+        self.assertEqual(calls, ["apply"])
+        self.assertEqual(control.stream.head, 1)
+
+    def test_projection_ack_not_published_when_apply_fails(self):
+        control = RampWorkflowControl()
+
+        def conflicted():
+            raise RuntimeError("batch version conflict")
+
+        with self.assertRaises(RuntimeError):
+            control.acknowledge_stream_projection("op-ack-2", "proj-1", self.at, conflicted)
+        self.assertEqual(control.stream.head, 0)
+        self.assertEqual(control.receipts, {})
+
+    def test_projection_ack_honours_requirements(self):
+        control = RampWorkflowControl()
+        calls = []
+        denied = Decision(False, "cursor-expired", "projection must reset from a snapshot")
+        with self.assertRaises(WorkflowRejected):
+            control.acknowledge_stream_projection(
+                "op-ack-3", "proj-1", self.at,
+                lambda: calls.append("apply"), requirements=(denied,),
+            )
+        self.assertEqual(calls, [])
+        self.assertEqual(control.stream.head, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
