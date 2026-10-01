@@ -31,7 +31,22 @@ class CursorPage:
 
 
 class CursorExpired(RuntimeError):
-    pass
+    """Raised when an incremental cursor can no longer be served.
+
+    The caller must load a full projection snapshot at (or after)
+    ``reset_cursor`` and resume from that snapshot's sequence.  The stream
+    never silently skips the missing range and appends newer events to the
+    caller's old state.
+    """
+
+    def __init__(self, cursor: int, floor: int, reset_cursor: int):
+        self.cursor = cursor
+        self.floor = floor
+        self.reset_cursor = reset_cursor
+        super().__init__(
+            f"cursor {cursor} is before retained floor {floor}; "
+            f"reset from a snapshot at sequence {reset_cursor}"
+        )
 
 
 class EventStream:
@@ -125,19 +140,25 @@ class EventStream:
         with self._lock:
             return self._events[0].sequence if self._events else self._next_sequence
 
-    def page(self, cursor: int, limit: int = 100, topics: Iterable[str] | None = None, strict: bool = False) -> CursorPage:
+    def page(self, cursor: int, limit: int = 100, topics: Iterable[str] | None = None, strict: bool = True) -> CursorPage:
         if limit < 1:
             raise ValueError("limit must be positive")
+        if cursor < 0:
+            raise ValueError("cursor must not be negative")
         topic_set = set(topics) if topics is not None else None
         with self._lock:
             floor = self.floor
-            gap = bool(self._events and cursor < floor - 2)
+            reset_cursor = floor - 1
+            # A cursor is the last sequence the projection has applied.  It is
+            # expired only when its next event (cursor + 1) has also been
+            # evicted; cursor == floor - 1 is still a normal continuation.
+            gap = bool(self._events and cursor < floor - 1)
             if gap and strict:
-                raise CursorExpired(f"cursor {cursor} before retained floor {floor}")
-            effective = max(cursor, floor - 1) if gap else cursor
+                raise CursorExpired(cursor, floor, reset_cursor)
+            effective = reset_cursor if gap else cursor
             selected = [e for e in self._events if e.sequence > effective and (topic_set is None or e.topic in topic_set)][:limit]
             next_cursor = selected[-1].sequence if selected else effective
-            return CursorPage(tuple(selected), next_cursor, gap, floor - 1 if gap else None)
+            return CursorPage(tuple(selected), next_cursor, gap, reset_cursor if gap else None)
 
     def wait_page(
         self,
@@ -145,13 +166,14 @@ class EventStream:
         timeout_seconds: float,
         limit: int = 100,
         topics: Iterable[str] | None = None,
+        strict: bool = True,
     ) -> CursorPage:
         with self._changed:
-            page = self.page(cursor, limit, topics)
+            page = self.page(cursor, limit, topics, strict=strict)
             if page.events or page.gap:
                 return page
             self._changed.wait(timeout_seconds)
-            return self.page(cursor, limit, topics)
+            return self.page(cursor, limit, topics, strict=strict)
 
     def verify_chain(self) -> bool:
         with self._lock:

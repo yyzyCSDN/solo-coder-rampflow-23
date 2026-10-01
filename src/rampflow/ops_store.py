@@ -98,33 +98,43 @@ class VersionedStore(Generic[T]):
 
     def batch(self, ops: Iterable[tuple[str, str, T | None, int | None]], actor: str, reason: str, at: datetime) -> tuple[Versioned[T] | None, ...]:
         at = utc(at)
-        out = []
+        operations = tuple(ops)
         with self._lock:
-            for action, key, value, expected in tuple(ops):
-                old = self._records.get(key)
+            # Validate every operation against a working copy first.  A failed
+            # expectation in the latter half must leave the store unchanged;
+            # otherwise projections can commit a mixture of old and new state.
+            working = dict(self._records)
+            planned: list[tuple[str, Versioned[T] | None, Versioned[T] | None]] = []
+            for action, key, value, expected in operations:
+                old = working.get(key)
                 if action == "create":
                     if old is not None:
                         raise VersionConflict(f"{key} already exists")
                     rec = Versioned(key, 1, at, value)
-                    self._commit_change(key, old, rec, actor, reason, at)
-                    out.append(rec)
                 elif action == "put":
                     if old is None:
                         raise MissingEntity(key)
                     if expected != old.version:
                         raise VersionConflict(f"{key} stale")
                     rec = Versioned(key, old.version + 1, at, value)
-                    self._commit_change(key, old, rec, actor, reason, at)
-                    out.append(rec)
                 elif action == "delete":
                     if old is None:
                         raise MissingEntity(key)
                     if expected != old.version:
                         raise VersionConflict(f"{key} stale")
-                    self._commit_change(key, old, None, actor, reason, at)
-                    out.append(None)
+                    rec = None
                 else:
                     raise ValueError(f"unknown operation {action}")
+                planned.append((key, old, rec))
+                if rec is None:
+                    working.pop(key, None)
+                else:
+                    working[key] = rec
+
+            out = []
+            for key, old, rec in planned:
+                self._commit_change(key, old, rec, actor, reason, at)
+                out.append(rec)
             return tuple(out)
 
     def changes(self,after_sequence:int=0)->tuple[Change[T],...]:
